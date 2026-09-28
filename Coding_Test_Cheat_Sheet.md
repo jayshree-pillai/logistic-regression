@@ -209,3 +209,56 @@ async def resume_question(
     )
     return (await question_graph.aget_state(config)).values
 ```
+**M02_runner.py — run 30 questions with semaphore(5)**
+```python
+async def run_section_questions(
+    state: SectionState,
+    question_graph,
+    max_concurrency: int = 5,
+) -> SectionState:
+    if max_concurrency < 1:
+        raise ValueError("max_concurrency must be positive")
+
+    semaphore = asyncio.Semaphore(max_concurrency)
+
+    async def run_one(qid: int) -> dict:
+        async with semaphore:
+            key = f"{state['car_id']}:{state['section_id']}:{qid}"
+            config = {"configurable": {"thread_id": key}}
+            #Read the existing checkpoint async;If this question has saved state and no remaining work, do not run it again.
+            snapshot = await question_graph.aget_state(config)
+            if snapshot.values and not snapshot.next:
+                return snapshot.values  # Question Finshed ; return state immediately
+
+            initial_state = {
+                "car_id": state["car_id"],
+                "section_id": state["section_id"],
+                "question_id": qid,
+                "idempotency_key": key,
+                "status": "pending",
+            }
+            if snapshot.values: ## run the next step in the stateGraph
+                await question_graph.ainvoke(None, config=config)
+            else: ## run from start
+                await question_graph.ainvoke(initial_state, config=config)
+                
+            # Read the actual question state, without the __interrupt__ envelope.
+            return (await question_graph.aget_state(config)).values
+
+    results = await asyncio.gather(
+        *(run_one(qid) for qid in state["question_ids"])
+    )
+    question_results = merge_question_results(
+        state.get("question_results", {}),
+        {result["question_id"]: result for result in results},
+    )
+
+    if any(result["status"] == "awaiting_human" for result in results):
+        status = "awaiting_human"
+    elif all(result["status"] == "completed" for result in results):
+        status = "running"  # Ready for narrative generation; section not done yet.
+    else:
+        status = "failed"
+
+    return {**state, "question_results": question_results, "status": status}
+```
